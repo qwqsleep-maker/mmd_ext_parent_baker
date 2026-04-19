@@ -1,0 +1,9 @@
+schema_version = "1.0.0"
+id = "mmd_ext_parent_baker"
+version = "0.1.0"
+name = "MMD External Parent Baker"
+tagline = "Offline external-parent baker for mmd_tools scenes"
+maintainer = "OpenAI Codex"
+type = "add-on"
+license = ["SPDX:MIT"]
+blender_version_min = "4.0.0"
