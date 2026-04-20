@@ -23,28 +23,12 @@ class TransformChannels:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedExternalParentState:
-    apply_location: bool
-    apply_rotation: bool
-    target_location: Vector3
-    target_rotation: Quaternion4
-    target_source_armature_matrix: Matrix4
-
-
-@dataclass(frozen=True, slots=True)
 class ResolvedExternalParentBakePose:
     target_rest_rotation_inverse: Quaternion4
     external_parent_world_matrix: Matrix4
     source_rest_rotation_only_matrix: Matrix4
     source_world_matrix: Matrix4
     source_armature_matrix: Matrix4
-
-
-@dataclass(frozen=True, slots=True)
-class ExternalParentTargetLink:
-    rest_translation: Vector3
-    pose_location: Vector3
-    pose_rotation: Quaternion4
 
 
 def apply_cut_sample(
@@ -55,41 +39,6 @@ def apply_cut_sample(
     adjusted = dict(local_channels)
     adjusted[pose_bone_name] = sampled_channels
     return adjusted
-
-
-def resolve_external_parent_state(
-    source_armature_world: Matrix4,
-    target_armature_world: Matrix4,
-    target_chain_links: tuple[ExternalParentTargetLink, ...],
-    *,
-    apply_location: bool = True,
-    apply_rotation: bool = True,
-) -> ResolvedExternalParentState:
-    target_zero_rest_armature_matrix = compose_matrix((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
-    for link in target_chain_links:
-        target_zero_rest_armature_matrix = multiply_matrices(
-            target_zero_rest_armature_matrix,
-            compose_matrix(link.rest_translation, (1.0, 0.0, 0.0, 0.0)),
-        )
-        target_zero_rest_armature_matrix = multiply_matrices(
-            target_zero_rest_armature_matrix,
-            compose_matrix(link.pose_location, link.pose_rotation),
-        )
-    target_zero_rest_world_matrix = multiply_matrices(
-        target_armature_world,
-        target_zero_rest_armature_matrix,
-    )
-    target_source_armature_matrix = multiply_matrices(
-        invert_rigid_matrix(source_armature_world),
-        target_zero_rest_world_matrix,
-    )
-    return ResolvedExternalParentState(
-        apply_location=apply_location,
-        apply_rotation=apply_rotation,
-        target_location=matrix_to_translation(target_source_armature_matrix),
-        target_rotation=normalize_quaternion(matrix_to_quaternion(target_source_armature_matrix)),
-        target_source_armature_matrix=target_source_armature_matrix,
-    )
 
 
 def resolve_external_parent_bake_pose(
@@ -123,117 +72,6 @@ def resolve_external_parent_bake_pose(
         source_rest_rotation_only_matrix=source_rest_rotation_only_matrix,
         source_world_matrix=source_world_matrix,
         source_armature_matrix=source_armature_matrix,
-    )
-
-
-def compute_zero_rest_translation(
-    head_local: Vector3,
-    parent_head_local: Vector3 | None,
-) -> Vector3:
-    if parent_head_local is None:
-        return (float(head_local[0]), float(head_local[1]), float(head_local[2]))
-    return (
-        float(head_local[0]) - float(parent_head_local[0]),
-        float(head_local[1]) - float(parent_head_local[1]),
-        float(head_local[2]) - float(parent_head_local[2]),
-    )
-
-
-def convert_zero_rest_pose_location(
-    raw_pose_location: Vector3,
-    rest_local: Matrix4,
-) -> Vector3:
-    return rotate_vector(matrix_to_quaternion(rest_local), raw_pose_location)
-
-
-def resolve_zero_rest_local_channels(
-    raw_pose_location: Vector3,
-    raw_pose_rotation: Quaternion4,
-    rest_local: Matrix4,
-) -> LocalChannels:
-    return (
-        convert_zero_rest_pose_location(raw_pose_location, rest_local),
-        raw_pose_rotation,
-    )
-
-
-def build_zero_rest_helper_absolute_pose(
-    *,
-    carrier_pose: Matrix4,
-    source_rest_translation: Vector3,
-    source_local_location: Vector3,
-    source_local_rotation: Quaternion4,
-) -> Matrix4:
-    return multiply_matrices(
-        carrier_pose,
-        multiply_matrices(
-            compose_matrix(source_rest_translation, (1.0, 0.0, 0.0, 0.0)),
-            compose_matrix(source_local_location, source_local_rotation),
-        ),
-    )
-
-
-def build_semantic_parent_pose(
-    parent_pose: Matrix4,
-    resolved_state: ResolvedExternalParentState | None,
-) -> Matrix4:
-    if resolved_state is None:
-        return parent_pose
-    semantic_location = matrix_to_translation(parent_pose)
-    semantic_rotation = normalize_quaternion(matrix_to_quaternion(parent_pose))
-    if resolved_state.apply_location:
-        semantic_location = resolved_state.target_location
-    if resolved_state.apply_rotation:
-        semantic_rotation = resolved_state.target_rotation
-    return compose_matrix(semantic_location, semantic_rotation)
-
-
-def build_semantic_pose(
-    *,
-    parent_pose: Matrix4,
-    rest_local: Matrix4,
-    semantic_rest_local: Matrix4 | None = None,
-    local_location: Vector3,
-    local_rotation: Quaternion4,
-    resolved_state: ResolvedExternalParentState | None,
-) -> Matrix4:
-    semantic_parent_pose = build_semantic_parent_pose(parent_pose, resolved_state)
-    if semantic_rest_local is None:
-        semantic_rest_local = rest_local
-    local_anim = compose_matrix(local_location, local_rotation)
-    return multiply_matrices(semantic_parent_pose, multiply_matrices(semantic_rest_local, local_anim))
-
-
-def decompose_local_channels(
-    *,
-    parent_pose: Matrix4,
-    rest_local: Matrix4,
-    absolute_pose: Matrix4,
-) -> LocalChannels:
-    basis = multiply_matrices(
-        invert_rigid_matrix(rest_local),
-        multiply_matrices(invert_rigid_matrix(parent_pose), absolute_pose),
-    )
-    return (
-        matrix_to_translation(basis),
-        normalize_quaternion(matrix_to_quaternion(basis)),
-    )
-
-
-def decompose_zero_rest_local_channels(
-    *,
-    parent_pose: Matrix4,
-    rest_local: Matrix4,
-    absolute_pose: Matrix4,
-) -> LocalChannels:
-    semantic_rest_local = compose_matrix(matrix_to_translation(rest_local), (1.0, 0.0, 0.0, 0.0))
-    basis = multiply_matrices(
-        invert_rigid_matrix(semantic_rest_local),
-        multiply_matrices(invert_rigid_matrix(parent_pose), absolute_pose),
-    )
-    return (
-        matrix_to_translation(basis),
-        normalize_quaternion(matrix_to_quaternion(basis)),
     )
 
 
