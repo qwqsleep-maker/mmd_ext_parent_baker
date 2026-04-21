@@ -1,0 +1,157 @@
+name: Release Add-on
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to create or update
+        required: true
+        type: string
+      release_name:
+        description: Optional release title
+        required: false
+        type: string
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out add-on repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag_name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ inputs.release_name || inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ github.event.release.name || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read web bundle lock
+        id: web_bundle
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          data = tomllib.loads(Path("web_bundle.toml").read_text(encoding="utf-8"))
+          repo_url = data["web"]["repo"]
+          ref = data["web"]["ref"]
+          repository = urlparse(repo_url).path.lstrip("/").removesuffix(".git")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              print(f"repo_url={repo_url}", file=fh)
+              print(f"repository={repository}", file=fh)
+              print(f"ref={ref}", file=fh)
+          PY
+
+      - name: Check out locked mmd_ext_parent_baker_web source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.web_bundle.outputs.repository }}
+          ref: ${{ steps.web_bundle.outputs.ref }}
+          path: _web_bundle
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: _web_bundle/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: _web_bundle
+        run: npm ci
+
+      - name: Test web bundle
+        working-directory: _web_bundle
+        run: npm test
+
+      - name: Build web bundle
+        working-directory: _web_bundle
+        run: npm run build
+
+      - name: Build Blender release zip
+        shell: bash
+        run: |
+          python - <<'PY'
+          import shutil
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          repo_root = Path(".").resolve()
+          manifest = tomllib.loads((repo_root / "blender_manifest.toml").read_text(encoding="utf-8"))
+          addon_id = manifest["id"]
+          addon_version = manifest["version"]
+          web_dist = repo_root / "_web_bundle" / "dist"
+
+          if not (web_dist / "index.html").is_file():
+              raise SystemExit("web bundle dist/index.html is missing")
+
+          release_root = repo_root / "_release"
+          stage_root = release_root / addon_id
+          zip_output = repo_root / "release" / f"{addon_id}-{addon_version}.zip"
+
+          if release_root.exists():
+              shutil.rmtree(release_root)
+          if zip_output.exists():
+              zip_output.unlink()
+
+          stage_root.mkdir(parents=True, exist_ok=True)
+          zip_output.parent.mkdir(parents=True, exist_ok=True)
+
+          excluded_names = {
+              ".git",
+              ".github",
+              ".gitignore",
+              ".vscode",
+              "__pycache__",
+              "_release",
+              "_web_bundle",
+              "release",
+              "web_bundle.toml",
+              "web_dist",
+          }
+
+          for path in repo_root.iterdir():
+              if path.name in excluded_names:
+                  continue
+              if path.is_dir():
+                  shutil.copytree(
+                      path,
+                      stage_root / path.name,
+                      ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                  )
+              else:
+                  shutil.copy2(path, stage_root / path.name)
+
+          shutil.copytree(web_dist, stage_root / "web_dist")
+
+          with zipfile.ZipFile(zip_output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in stage_root.rglob("*"):
+                  archive.write(path, path.relative_to(release_root))
+          PY
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: ${{ steps.release_meta.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          files: release/*.zip
+          fail_on_unmatched_files: true

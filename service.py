@@ -11,8 +11,19 @@ from urllib.parse import urlparse
 import bpy
 
 from .bake_runtime import execute_external_parent_bake
+from .http_utils import bind_threading_http_server
 from .protocol import parse_bake_request
 from .scene_query import collect_scene_summary
+from .ui_service import (
+    UIServiceRuntime,
+    browser_host_for_url,
+    has_web_bundle,
+    resolve_web_bundle_dir,
+    start_ui_service,
+    stop_ui_service,
+)
+
+DEFAULT_PREFERRED_API_PORT = 37601
 
 
 @dataclass(slots=True)
@@ -31,30 +42,69 @@ class ServiceRuntime:
     server: ThreadingHTTPServer | None = None
     thread: threading.Thread | None = None
     timer_registered: bool = False
+    ui_runtime: UIServiceRuntime | None = None
+    ui_bundle_available: bool = False
+    ui_error: str | None = None
 
 
 _runtime: ServiceRuntime | None = None
 
 
-def start_service(host: str, port: int) -> None:
+def start_service(host: str, preferred_port: int = DEFAULT_PREFERRED_API_PORT) -> None:
     global _runtime
 
     if _runtime is not None:
-        if _runtime.host == host and _runtime.port == port:
+        if _runtime.host == host:
+            if _runtime.ui_runtime is None and has_web_bundle(resolve_web_bundle_dir()):
+                _runtime.ui_runtime = start_ui_service(
+                    host=host,
+                    api_base_url=_build_api_base_url(_runtime.host, _runtime.port),
+                    bundle_dir=resolve_web_bundle_dir(),
+                )
+                _runtime.ui_bundle_available = _runtime.ui_runtime is not None
+                _runtime.ui_error = None if _runtime.ui_runtime is not None else "Web UI bundle missing"
             return
         stop_service()
 
-    runtime = ServiceRuntime(host=host, port=port)
-    runtime.server = ThreadingHTTPServer((host, port), _build_handler(runtime))
-    runtime.server.daemon_threads = True
-    runtime.thread = threading.Thread(
-        target=runtime.server.serve_forever,
-        name="mmd-ext-parent-baker-http",
-        daemon=True,
-    )
-    runtime.thread.start()
-    bpy.app.timers.register(_process_pending_requests, first_interval=0.1, persistent=True)
-    runtime.timer_registered = True
+    runtime = ServiceRuntime(host=host, port=0)
+    bundle_dir = resolve_web_bundle_dir()
+    runtime.ui_bundle_available = has_web_bundle(bundle_dir)
+
+    try:
+        runtime.server = bind_threading_http_server(host, preferred_port, _build_handler(runtime))
+        runtime.port = runtime.server.server_port
+        runtime.thread = threading.Thread(
+            target=runtime.server.serve_forever,
+            name="mmd-ext-parent-baker-http",
+            daemon=True,
+        )
+        runtime.thread.start()
+        bpy.app.timers.register(_process_pending_requests, first_interval=0.1, persistent=True)
+        runtime.timer_registered = True
+
+        if runtime.ui_bundle_available:
+            runtime.ui_runtime = start_ui_service(
+                host=host,
+                api_base_url=_build_api_base_url(runtime.host, runtime.port),
+                bundle_dir=bundle_dir,
+            )
+            runtime.ui_error = None if runtime.ui_runtime is not None else "Web UI bundle missing"
+        else:
+            runtime.ui_error = "Web UI bundle missing"
+    except Exception:
+        stop_ui_service(runtime.ui_runtime)
+        if runtime.server is not None:
+            runtime.server.shutdown()
+            runtime.server.server_close()
+        if runtime.thread is not None:
+            runtime.thread.join(timeout=1.0)
+        if runtime.timer_registered:
+            try:
+                bpy.app.timers.unregister(_process_pending_requests)
+            except Exception:
+                pass
+        raise
+
     _runtime = runtime
 
 
@@ -66,6 +116,7 @@ def stop_service() -> None:
     if runtime is None:
         return
 
+    stop_ui_service(runtime.ui_runtime)
     if runtime.server is not None:
         runtime.server.shutdown()
         runtime.server.server_close()
@@ -80,19 +131,41 @@ def stop_service() -> None:
 
 def get_service_status() -> dict[str, Any]:
     runtime = _runtime
+    ui_bundle_available = has_web_bundle(resolve_web_bundle_dir())
     if runtime is None:
         return {
             "running": False,
             "host": None,
             "port": None,
             "base_url": None,
+            "api_running": False,
+            "api_base_url": None,
+            "ui_running": False,
+            "ui_port": None,
+            "ui_base_url": None,
+            "ui_launch_url": None,
+            "ui_bundle_available": ui_bundle_available,
+            "ui_error": None if ui_bundle_available else "Web UI bundle missing",
         }
+    api_base_url = _build_api_base_url(runtime.host, runtime.port)
     return {
         "running": True,
         "host": runtime.host,
         "port": runtime.port,
-        "base_url": f"http://{runtime.host}:{runtime.port}",
+        "base_url": api_base_url,
+        "api_running": True,
+        "api_base_url": api_base_url,
+        "ui_running": runtime.ui_runtime is not None,
+        "ui_port": runtime.ui_runtime.port if runtime.ui_runtime is not None else None,
+        "ui_base_url": runtime.ui_runtime.base_url if runtime.ui_runtime is not None else None,
+        "ui_launch_url": runtime.ui_runtime.launch_url if runtime.ui_runtime is not None else None,
+        "ui_bundle_available": runtime.ui_bundle_available,
+        "ui_error": None if runtime.ui_runtime is not None else runtime.ui_error,
     }
+
+
+def _build_api_base_url(host: str, port: int) -> str:
+    return f"http://{browser_host_for_url(host)}:{port}"
 
 
 def _process_pending_requests() -> float | None:
