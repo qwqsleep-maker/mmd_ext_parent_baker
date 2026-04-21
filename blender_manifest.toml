@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "mmd_ext_parent_baker"
-version = "0.1.0"
+version = "0.1.1"
 name = "MMD External Parent Baker"
 tagline = "Offline external-parent baker for mmd_tools scenes"
 maintainer = "FLOAT_WORLD"
